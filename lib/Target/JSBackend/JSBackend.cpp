@@ -49,6 +49,7 @@
 #include <map>
 #include <set> // TODO: unordered_set?
 #include <sstream>
+#include <fstream>
 using namespace llvm;
 
 #include <OptPasses.h>
@@ -169,6 +170,15 @@ OnlyWebAssembly("emscripten-only-wasm",
                 cl::desc("Generate code that will only ever be used as WebAssembly, and is not valid JS or asm.js"),
                 cl::init(false));
 
+static cl::opt<bool>
+NoUnalignedAccess("emscripten-no-unaligned-access",
+                cl::desc("Prevent unaligned access (very low performance)"),
+                cl::init(false));
+
+static cl::opt<std::string>
+UnalignedFunctionsList("emscripten-unaligned-functions-list-file",
+                cl::desc("Prevent unaligned access in functions listed in file"),
+                cl::init(""));
 
 extern "C" void LLVMInitializeJSBackendTarget() {
   // Register the target.
@@ -286,7 +296,7 @@ namespace {
         UsesSIMDFloat32x4(false), UsesSIMDFloat64x2(false), UsesSIMDBool8x16(false),
         UsesSIMDBool16x8(false), UsesSIMDBool32x4(false), UsesSIMDBool64x2(false), InvokeState(0),
         OptLevel(OptLevel), StackBumped(false), GlobalBasePadding(0), MaxGlobalAlign(0),
-        CurrInstruction(nullptr) {}
+        CurrInstruction(nullptr), unalignedListInitialized(false) {}
 
     StringRef getPassName() const override { return "JavaScript backend"; }
 
@@ -869,6 +879,11 @@ namespace {
     // main entry point
 
     void printModuleBody();
+
+    // unaligned functions list
+    bool unalignedListInitialized;
+    std::set<std::string> unalignedSet;
+    bool IsForceUnalignedFunction( const std::string &name );
   };
 } // end anonymous namespace.
 
@@ -1271,9 +1286,43 @@ static const char *heapNameToAtomicTypeName(const char *HeapName)
   return "";
 }
 
+bool JSWriter::IsForceUnalignedFunction(const std::string &name)
+{
+  // Return true if all loads/stores in this function should be threated as unaligned 
+  // --emscripten-no-unaligned-access means disable alignment check everywhere
+  if (NoUnalignedAccess)
+    return false;
+  if (UnalignedFunctionsList.empty())
+    return false;
+  // --emscripten-unaligned-functions-list-file specified
+  // Read this file and fill string set on first call
+  if (!unalignedListInitialized)
+  {
+    std::ifstream file;
+    std::string func;
+    file.open(UnalignedFunctionsList);
+    unalignedListInitialized = true;
+    if (!file.good())
+    {
+      if (!UnalignedFunctionsList.empty())
+        error("Could not read unaligned functions list");
+      return false;
+    }
+    while (file >> func)
+      unalignedSet.insert(func);
+    file.close();
+  }
+  if (unalignedSet.find(name) != unalignedSet.end())
+    return true;
+  return false;
+}
+
 std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, unsigned Alignment, char sep) {
   std::string Assign = getAssign(I);
   unsigned Bytes = DL->getTypeAllocSize(T);
+  if (Alignment != 1 && IsForceUnalignedFunction(I->getFunction()->getName()))
+    Alignment = 1;
+
   bool Aligned = Bytes <= Alignment || Alignment == 0;
   if (OnlyWebAssembly) {
     if (isAbsolute(P)) {
@@ -1415,6 +1464,8 @@ std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, uns
 std::string JSWriter::getStore(const Instruction *I, const Value *P, Type *T, const std::string& VS, unsigned Alignment, char sep) {
   assert(sep == ';'); // FIXME when we need that
   unsigned Bytes = DL->getTypeAllocSize(T);
+  if (Alignment != 1 && IsForceUnalignedFunction(I->getFunction()->getName()))
+    Alignment = 1;
   bool Aligned = Bytes <= Alignment || Alignment == 0;
   if (OnlyWebAssembly) {
     if (Alignment == 536870912) {
